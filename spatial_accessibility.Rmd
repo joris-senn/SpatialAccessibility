@@ -1,0 +1,653 @@
+---
+title: "geo885_project"
+author: "Nicola Maiani & Joris Senn"
+date: "4/4/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(reshape2)
+library(fca)
+library(tidyverse)
+library(ggplot2)
+library(rgdal)
+library(sf)
+```
+
+```{r}
+# Loading the shapefiles for the visualizations
+sf_grenze <- st_read(dsn = file.path("gemeindegrenze/Gemeindegrenze.shp")) # Boundary of the city of Zurich
+sf_bike_network <- st_read(dsn = file.path("Velonetzwerk/bikepath_network_ZH.shp")) # Bike network of the city of Zurich
+sf_car_network <- st_read(dsn = file.path("Strassennetz/relevant_roads_Zurich_speed.shp")) # Car network of the city of Zurich
+sf_statzonen <- st_read(dsn = file.path("Statzonen/Statzonen_Pop.shp")) # Statistical zones of the city of Zurich
+sf_spitex <- st_read(dsn = file.path("SpitexLocations/SpitexLocs.shp")) # Spitex locations in the city of Zurich
+```
+
+Here we classify the absolute population values for the Figure 3. 
+```{r}
+# adding categorical variable based on TOT
+sf_statzonen$TOT_cat <- NA
+
+# 5 classes
+sf_statzonen$TOT_cat[sf_statzonen$TOT < 300] <- "< 300"
+sf_statzonen$TOT_cat[sf_statzonen$TOT >= 300 & sf_statzonen$TOT < 600] <- "300 - 600"
+sf_statzonen$TOT_cat[sf_statzonen$TOT >= 600 & sf_statzonen$TOT < 900] <- "600 - 900"
+sf_statzonen$TOT_cat[sf_statzonen$TOT >= 900 & sf_statzonen$TOT <= 1200] <- "900 - 1200"
+sf_statzonen$TOT_cat[sf_statzonen$TOT > 1200] <- "> 1200"
+
+# Transform to factor
+sf_statzonen$TOT_cat <- as.factor(sf_statzonen$TOT_cat)
+```
+
+Figure 3
+```{r}
+pal <- hcl.colors(5, "Blues", rev = TRUE, alpha = 0.9)
+
+ggplot() + geom_sf(data = sf_grenze, fill="gray", size=0.75) + 
+  geom_sf(data = sf_statzonen, aes(fill=TOT_cat), color="grey", lwd=0.1) + 
+  scale_fill_manual(values=pal, breaks=c("< 300", "300 - 600", "600 - 900", "900 - 1200", "> 1200")) +
+  geom_sf(data = sf_spitex, aes(col="Spitex locations"), shape=17, size=2) +
+  coord_sf(datum = 2056) + 
+  theme_void() +
+  labs(title="Elderly population in Zurich", fill="Population 65+", colour="")
+
+#ggsave("figures/elderly_pop.jpg")
+#ggsave("figures/elderly_pop_spitex.jpg")
+```
+
+Figure 4 (right)
+```{r}
+ggplot() + geom_sf(data = sf_grenze, fill="white", size=0.75) + 
+  geom_sf(data=sf_bike_network, col="black", size=0.25) +
+  coord_sf(datum = 2056) + 
+  theme_void() +
+  labs(title="Bike network of Zurich")
+
+#ggsave("figures/bike_network.jpg")
+```
+
+Figure 4 (left)
+```{r}
+ggplot() + geom_sf(data = sf_grenze, fill="white", size=0.75) + 
+  geom_sf(data=sf_car_network, aes(colour=as.factor(Speed))) +
+  coord_sf(datum = 2056) + 
+  theme_void() +
+  labs(title="Car network of Zurich", colour="Speed limit")
+
+#ggsave("figures/car_network.jpg")
+```
+
+```{r}
+# The OD-matrices (QGIS output) had a different format than was expected from the fca package. Therefore we wrote a function for changing the shape of the OD-matrices, such that it can be used as input for fca package.
+convertODmatrix <- function(path){
+  df <- read.csv(path)
+  
+  # creating distance matrix
+  df <- df[order(df$destination_id),]
+  dfr <- acast(df, origin_id ~ destination_id, value.var="total_cost")
+  
+  return(dfr)
+}
+
+# This function was not used in the end, we thought it might be necessary to assign subzones at the beginning.
+convertODmatrix_subzones <- function(path){
+  df <- read.csv(path)
+  
+  # creating distance matrix
+  df <- df[order(df$destination_id),]
+  dfr <- acast(df, origin_id ~ destination_id, value.var="total_cost")
+  
+  # Assigning subzones to the matrix elements: 2 min subzones are assigned mid-time-point
+  max_subzone <- (max(dfr) %/% 120) * 120
+  subzone_start <- seq(0, max_subzone, by=120)
+  
+  # midpoints of the subzones in seconds
+  mins <- 60
+  subzones <- dfr
+  
+  # assigning seconds
+  for (i in 1:length(subzone_start)){
+    subzones[subzone_start[i] < subzones & subzones <= subzone_start[i] + 120] <- mins
+    mins <- mins + 120
+  }
+  
+  return(subzones)
+}
+
+# These two functions were used in the calculation of the E2SFCA, which we implemented ourselves in the next chunk
+
+# calculates optimal Beta for given d_max for Gaussian distance weighting function
+# f(dmax) = 0.01 is considered to be an optimal value when the Gaussian function tends to zero.
+# This ensures that the distance function is small at dmax.
+# (see Jörg et al. 2019 p.47-48)
+calculateBeta <- function(dmax){
+  return(-dmax^2 / log(0.01))
+}
+
+# gaussian distance weighting function
+gaussDist <- function(d, beta){
+  return(exp(-d^2 / beta))
+}
+```
+
+The following two functions are our implementations of the 2SFCA and the E2SFCA methods.
+```{r}
+# MAKE SURE THAT THE POP AND CAP VECTORS ARE ORDERED THE SAME WAY AS IN THE O-D MATRIX!
+TWOSFCA <- function(pop, cap, od.matrix, dmax){
+  # Ratio of supply and demand (same named vector structure as input vector cap)
+  R <- cap
+  # converting O-D matrix to a dataframe for easier indexing
+  matrix_df <- data.frame(od.matrix)
+  
+  # Step 1: Calculation of ratio of supply and demand for each supply location
+  # --> requires loop through all supply points (capacity, rows)
+  for (j in 1:length(cap)){
+    # All population points within dmax from jth supply point
+    within_dmax <- matrix_df[j, matrix_df[j,] <= dmax]
+    
+    # Extracting keys / ids (column names) of all population points within dmax from jth supply point
+    # Formatting substrings since names are changed when creating dataframe from matrix
+    pop_within_dmax <- substr(colnames(within_dmax), start=2, stop=nchar(colnames(within_dmax)))
+    
+    # Computing sum of population within dmax from jth supply point
+    sum_pop_within_dmax <- sum(pop[pop_within_dmax])
+
+    # Computing ratio of supply and demand for jth supply point
+    R[j] <- cap[j] / sum_pop_within_dmax 
+  }
+
+  SPAI <- data.frame(RELI=as.integer(names(pop)), SPAI=NA)
+
+  # Step 2: Calculation of spatial accessibility index for each population point
+  # --> requires loop through all demand points (population, columns)
+  for (i in 1:length(pop)){
+    # Extracting keys / ids (row names) of all Spitex locations within dmax from ith population point
+    supply_within_dmax <- rownames(matrix_df)[which(matrix_df[,i] <= dmax)]
+
+    # SPAI for ith population point is the sum of all ratios of supply and demand of Spitex locations within dmax
+    SPAI[i,"SPAI"] <- sum(R[supply_within_dmax])
+  }
+  
+  return(SPAI)
+}
+
+# MAKE SURE THAT THE POP AND CAP VECTORS ARE ORDERED THE SAME WAY AS IN THE O-D MATRIX!
+ETWOSFCA <- function(pop, cap, od.matrix, dmax){
+  # Ratio of supply and demand (same named vector structure as input vector cap)
+  R <- cap
+  # converting O-D matrix to a dataframe for easier indexing
+  matrix_df <- data.frame(od.matrix)
+  
+  # Calculation of optimal distance friction coefficient Beta (Jörg et al. 2019, p.48)
+  # for the Gaussian distance weighting function
+  beta <- calculateBeta(dmax)
+  
+  # Step 1: Calculation of ratio of supply and demand for each supply location
+  # --> requires loop through all supply points (capacity, rows)
+  for (j in 1:length(cap)){
+    # All population points within dmax from jth supply point
+    within_dmax <- matrix_df[j, matrix_df[j,] <= dmax]
+
+    # Extracting keys / ids (column names) of all population points within dmax from jth supply point
+    # Formatting substrings since names are changed when creating dataframe from matrix
+    pop_within_dmax <- substr(colnames(within_dmax), start=2, stop=nchar(colnames(within_dmax)))
+
+    # Computing sum of population within dmax from jth supply point
+    # E2SFCA additionally incorporates distance weight using gaussian distance weighting function
+    sum_pop_within_dmax <- sum(pop[pop_within_dmax] * gaussDist(matrix_df[j, colnames(within_dmax)], beta))
+
+    # Computing ratio of supply and demand for jth supply point
+    R[j] <- cap[j] / sum_pop_within_dmax 
+  }
+
+  SPAI <- data.frame(RELI=as.integer(names(pop)), SPAI=NA)
+
+  # Step 2: Calculation of spatial accessibility index for each population point
+  # --> requires loop through all demand points (population, columns)
+  for (i in 1:length(pop)){
+    # Extracting keys / ids (row names) of all Spitex locations within dmax from ith population point
+    supply_within_dmax <- rownames(matrix_df)[which(matrix_df[,i] <= dmax)]
+
+    # SPAI for ith population point is the sum of all ratios of supply and demand of Spitex locations within dmax
+    # E2SFCA additionally incorporates distance weight using gaussian distance weighting function
+    SPAI[i,"SPAI"] <- sum(R[supply_within_dmax] * gaussDist(matrix_df[supply_within_dmax, i], beta))
+  }
+  
+  return(SPAI)
+}
+
+# normalize SPAI values to interval between 0 and 1.
+scaler <- function(x) {(x - min(x))/(max(x) - min(x))}
+```
+
+Calculates the optimal Beta given our d_max of 10 mins (600 seconds)
+```{r}
+calculateBeta(600)
+```
+
+Here we read, reshape, apply a correction factor and normalize the OD-Matrix, such that it can be used as input for the FCA methods.
+```{r}
+# Reading and reshaping the OD-matrices for modes of transport car and bike
+od_matrix_car <- convertODmatrix("OD_matrix_car.csv")
+od_matrix_bike <- convertODmatrix("OD_matrix_bike.csv")
+
+# correction factor to account for traffic in the car matrix
+corr_factor <- 1.3
+od_matrix_car <- od_matrix_car * corr_factor
+
+# For 3SFCA and MH3SFCA
+od_matrix_car_normalized <- dist_normalize(od_matrix_car, d_max=600, imp_function="gaussian", function_d_max=0.01)
+od_matrix_bike_normalized <- dist_normalize(od_matrix_bike, d_max=600, imp_function="gaussian", function_d_max=0.01)
+```
+
+Loading and preparing the data for supply and demand such that it can be used as input for the FCA methods.
+```{r}
+# Loading data for supply and demand
+spitex <- read.csv("stzh.poi_spitex_view.csv")
+statpop_org <- read.csv("STATPOP_ZURICH.csv")
+
+# ordering by ID (same order as OD matrix)
+statpop_org <- statpop_org[order(statpop_org$RELI),]
+spitex <- spitex[order(spitex$SpitexID),]
+
+# demand
+p <- setNames(statpop_org$TOT, as.character(statpop_org$RELI))
+# supply
+s <- setNames(spitex$Capacity_v1, as.character(spitex$SpitexID))
+```
+
+```{r}
+# Color palette for the maps
+pal_fca <- c("#132B43", "#28547A", "#3E81B7", "#56B1F7")
+```
+
+Figure 2
+```{r}
+statpop_quantile <- statpop_org %>%
+  mutate(quantile=ntile(TOT, 4))
+
+ggplot() + geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) + 
+  geom_point(data = statpop_quantile, aes(E_ZENTER, N_ZENTER, col=as.factor(quantile)), size = 0.5) +
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  theme_void() +
+  labs(title="Elderly people in Zurich", colour="Quartile of population 65+", fill="") +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/population.jpg")
+```
+
+# Calculation of FCA-methods
+
+Modified Huff Model three-step FCA
+```{r}
+# Calculation of MH3SFCA
+mh3sfca_spai_car <- spai_mh3sfca(p, s, od_matrix_car_normalized)
+mh3sfca_spai_bike <- spai_mh3sfca(p, s, od_matrix_bike_normalized)
+
+mh3sfca_spai_car$RELI <- rownames(mh3sfca_spai_car)
+mh3sfca_spai_bike$RELI <- rownames(mh3sfca_spai_bike)
+
+mh3sfca_spai_car$RELI <- as.integer(mh3sfca_spai_car$RELI)
+mh3sfca_spai_car <- left_join(statpop_org, mh3sfca_spai_car, by = "RELI")
+
+mh3sfca_spai_bike$RELI <- as.integer(mh3sfca_spai_bike$RELI)
+mh3sfca_spai_bike <- left_join(statpop_org, mh3sfca_spai_bike, by = "RELI")
+
+# Quartiles in SPAI
+mh3sfca_spai_car <- mh3sfca_spai_car %>% mutate(quantile=ntile(step3, 4))
+mh3sfca_spai_bike <- mh3sfca_spai_bike %>% mutate(quantile=ntile(step3, 4))
+```
+
+Figure 11 (left)
+```{r}
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = mh3sfca_spai_car, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) +
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="MH3SFCA with road network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/mh3sfca_car.jpg")
+```
+
+Figure 11 (right)
+```{r}
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = mh3sfca_spai_bike, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="MH3SFCA with bike network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/mh3sfca_bike.jpg")
+```
+
+Figure 12
+```{r}
+# normalize SPAI values to interval between 0 and 1.
+mh3sfca_spai_car <- mh3sfca_spai_car %>%
+  mutate(spai_norm = scaler(step3))
+
+mh3sfca_spai_bike <- mh3sfca_spai_bike %>%
+  mutate(spai_norm = scaler(step3))
+
+# difference (maybe also reclassify difference values close to 0 to "the same")
+mh3sfca_diff <- mh3sfca_spai_bike %>%
+  select(E_ZENTER, N_ZENTER) %>%
+  mutate(diff = mh3sfca_spai_bike$spai_norm - mh3sfca_spai_car$spai_norm) %>%
+  mutate(diff_cat = factor(ifelse(diff > 0, "bike better", "car better")))
+  #mutate(diff_cat = factor(ifelse(diff>0.05, "bike better", ifelse(diff<0.05 & diff>-0.05, "similar", "car better"))))
+
+# visualizing the difference
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = mh3sfca_diff, aes(E_ZENTER, N_ZENTER, colour=diff_cat), size = 0.5) + 
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="MH3SFCA difference between modes of transportation", colour="Accessibility", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/mh3sfca_diff.jpg")
+```
+
+Three-step FCA
+```{r}
+# Calculation of 3SFCA
+three_sfca_spai_car <- spai_3sfca(p, s, od_matrix_car_normalized)
+three_sfca_spai_bike <- spai_3sfca(p, s, od_matrix_bike_normalized)
+
+three_sfca_spai_car$RELI <- rownames(three_sfca_spai_car)
+three_sfca_spai_bike$RELI <- rownames(three_sfca_spai_bike)
+
+three_sfca_spai_car$RELI <- as.integer(three_sfca_spai_car$RELI)
+three_sfca_spai_car <- left_join(statpop_org, three_sfca_spai_car, by = "RELI")
+
+three_sfca_spai_bike$RELI <- as.integer(three_sfca_spai_bike$RELI)
+three_sfca_spai_bike <- left_join(statpop_org, three_sfca_spai_bike, by = "RELI")
+
+# Quartiles in SPAI
+three_sfca_spai_car <- three_sfca_spai_car %>% mutate(quantile=ntile(step3, 4))
+three_sfca_spai_bike <- three_sfca_spai_bike %>% mutate(quantile=ntile(step3, 4))
+```
+
+Figure 9 (left)
+```{r}
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = three_sfca_spai_car, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="3SFCA with road network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/3sfca_car.jpg")
+```
+
+Figure 9 (right)
+```{r}
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = three_sfca_spai_bike, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="3SFCA with bike network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/3sfca_bike.jpg")
+```
+
+Figure 10
+```{r}
+# normalize SPAI values to interval between 0 and 1.
+three_sfca_spai_car <- three_sfca_spai_car %>%
+  mutate(spai_norm = scaler(step3))
+
+three_sfca_spai_bike <- three_sfca_spai_bike %>%
+  mutate(spai_norm = scaler(step3))
+
+# difference (maybe also reclassify difference values close to 0 to "the same")
+three_sfca_diff <- three_sfca_spai_bike %>%
+  select(E_ZENTER, N_ZENTER) %>%
+  mutate(diff = three_sfca_spai_bike$spai_norm - three_sfca_spai_car$spai_norm) %>%
+  mutate(diff_cat = factor(ifelse(diff > 0, "bike better", "car better")))
+
+# visualizing the difference
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = three_sfca_diff, aes(E_ZENTER, N_ZENTER, colour=diff_cat), size = 0.5) + 
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="3SFCA difference between modes of transportation", colour="Accessibility", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/3sfca_diff.jpg")
+```
+
+2SCFA own implementation.
+```{r}
+# Calculation of 2SFCA by car
+SPAI_2SFCA_car <- TWOSFCA(p, s, od_matrix_car, 600)
+SPAI_2SFCA_car <- left_join(statpop_org, SPAI_2SFCA_car, by = "RELI")
+SPAI_2SFCA_car <- SPAI_2SFCA_car %>% mutate(quantile=ntile(SPAI, 4))
+
+# Figure 5 (left)
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_2SFCA_car, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="2SFCA with road network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/2sfca_car.jpg")
+```
+
+
+```{r}
+# Calculation of 2SFCA by bike
+SPAI_2SFCA_bike <- TWOSFCA(p, s, od_matrix_bike, 600)
+SPAI_2SFCA_bike <- left_join(statpop_org, SPAI_2SFCA_bike, by = "RELI")
+SPAI_2SFCA_bike <- SPAI_2SFCA_bike %>% mutate(quantile=ntile(SPAI, 4))
+
+# Figure 5 (right)
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_2SFCA_bike, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="2SFCA with bike network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/2sfca_bike.jpg")
+```
+
+```{r}
+# normalize SPAI values to interval between 0 and 1.
+SPAI_2SFCA_car <- SPAI_2SFCA_car %>%
+  mutate(spai_norm = scaler(SPAI))
+
+SPAI_2SFCA_bike <- SPAI_2SFCA_bike %>%
+  mutate(spai_norm = scaler(SPAI))
+
+# difference map
+SPAI_2SFCA_diff <- SPAI_2SFCA_bike %>%
+  select(E_ZENTER, N_ZENTER) %>%
+  mutate(diff = SPAI_2SFCA_bike$spai_norm - SPAI_2SFCA_car$spai_norm) %>%
+  mutate(diff_cat = factor(ifelse(diff > 0, "bike better", "car better")))
+
+# visualizing the difference
+# Figure 6
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_2SFCA_diff, aes(E_ZENTER, N_ZENTER, colour=diff_cat), size = 0.5) + 
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="2SFCA difference between modes of transportation", colour="Accessibility", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/2sfca_diff.jpg")
+```
+
+E2SFCA own implementation.
+```{r}
+# Calculation of E2SFCA by car
+SPAI_E2SFCA_car <- ETWOSFCA(p, s, od_matrix_car, 600)
+SPAI_E2SFCA_car <- left_join(statpop_org, SPAI_E2SFCA_car, by = "RELI")
+SPAI_E2SFCA_car <- SPAI_E2SFCA_car %>% mutate(quantile=ntile(SPAI, 4))
+
+# Figure 7 (left)
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_E2SFCA_car, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="E2SFCA by road network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/e2sfca_car.jpg")
+```
+
+```{r}
+# Calculation of E2SFCA by bike
+SPAI_E2SFCA_bike <- ETWOSFCA(p, s, od_matrix_bike, 600)
+SPAI_E2SFCA_bike <- left_join(statpop_org, SPAI_E2SFCA_bike, by = "RELI")
+SPAI_E2SFCA_bike <- SPAI_E2SFCA_bike %>% mutate(quantile=ntile(SPAI, 4))
+
+# Figure 7 (right)
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_E2SFCA_bike, aes(E_ZENTER, N_ZENTER, colour=as.factor(quantile)), size = 0.5) + 
+  scale_color_manual(values=pal_fca) +
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="E2SFCA with bike network", colour="SPAI quartile", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/e2sfca_bike.jpg")
+```
+
+```{r}
+# normalize SPAI values to interval between 0 and 1.
+SPAI_E2SFCA_car <- SPAI_E2SFCA_car %>%
+  mutate(spai_norm = scaler(SPAI))
+
+SPAI_E2SFCA_bike <- SPAI_E2SFCA_bike %>%
+  mutate(spai_norm = scaler(SPAI))
+
+# difference (maybe also reclassify difference values close to 0 to "the same")
+SPAI_E2SFCA_diff <- SPAI_E2SFCA_bike %>%
+  select(E_ZENTER, N_ZENTER) %>%
+  mutate(diff = SPAI_E2SFCA_bike$spai_norm - SPAI_E2SFCA_car$spai_norm) %>%
+  mutate(diff_cat = factor(ifelse(diff > 0, "bike better", "car better")))
+
+# visualizing the difference
+# Figure 8
+ggplot() + 
+  geom_sf(data = sf_grenze, fill="white") + 
+  coord_sf(datum = 2056) +
+  geom_point(data = SPAI_E2SFCA_diff, aes(E_ZENTER, N_ZENTER, colour=diff_cat), size = 0.5) + 
+  geom_point(data = spitex, aes(GKODE, GKODN, fill="Spitex locations"), size = 2, shape=17, col="red") +
+  labs(title="E2SFCA difference between modes of transportation", colour="Accessibility", fill="") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size=4)))
+
+#ggsave("figures/e2sfca_diff.jpg")
+```
+
+Correlation analysis
+```{r}
+SPAI_values <- data.frame("twoSFCA car"=SPAI_2SFCA_car$SPAI,
+                          "E2SFCA car"=SPAI_E2SFCA_car$SPAI,
+                          "threeSFCA car"=three_sfca_spai_car$step3,
+                          "MH3SFCA car"=mh3sfca_spai_car$step3,
+                          "twoSFCA bike"=SPAI_2SFCA_bike$SPAI,
+                          "E2SFCA bike"=SPAI_E2SFCA_bike$SPAI,
+                          "threeSFCA bike"=three_sfca_spai_bike$step3,
+                          "MH3SFCA bike"=mh3sfca_spai_bike$step3)
+
+round(cor(SPAI_values),2)
+```
+
+Figure 13
+```{r}
+#jpeg(file="figures/cor_v2.jpeg", width=1600, height=1350, quality=90)
+panel.cor <- function(x, y){
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- round(cor(x, y), digits=2)
+    # colored rectangles based on correlation value
+    if (r < 0){
+      #col <- "#C2A5CF"
+      col <- "#eaa07d"
+    }
+    if (r >= 0 & r < 0.33){
+      #col <- "#D9F0D3"
+      col <- "#ccd4ed"
+    }
+    if (r >= 0.33 & r < 0.66){
+      #col <- "#A6DBA0"
+      col <- "#99aadb"
+    }
+    if (r >= 0.66 & r < 0.9){
+      #col <- "#5AAE61"
+      col <- "#667fc9"
+    }
+    if (r >= 0.9){
+      #col <- "#1B7837"
+      col <- "#3354b7"
+    }
+    rect(0, 0, 1, 1, col=col)
+    txt <- paste0("Cor = ", r)
+    cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor)
+}
+
+panel.points<-function(x, y){
+  points(x,y, pch = 19, cex=0.25)
+  lines(smooth.spline(x=x, y=y, spar=1), col="red")
+}
+
+# diagonal text
+diag.labels <- c("2SFCA by car", "E2SFCA by car", "3SFCA by car", "MH3SFCA by car",
+                 "2SFCA by bike", "E2SFCA by bike", "3SFCA by bike", "MH3SFCA by bike")
+
+i <- 1
+
+panel.names <- function(x, y, labels, cex, font){
+  txt <- diag.labels[i]
+  cex.cor <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex = cex.cor, font=2)
+  
+  i <<- i + 1
+}
+
+pairs(SPAI_values, lower.panel=panel.points, upper.panel=panel.cor, text.panel=panel.names, gap=0)
+#dev.off()
+```
+
